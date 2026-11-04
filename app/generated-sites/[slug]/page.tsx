@@ -3,6 +3,8 @@ import { getGeneratedSiteBySlug } from '@/lib/storage'
 import GeneratedWebsiteRenderer from '@/components/GeneratedWebsiteRenderer'
 import type { Metadata } from 'next'
 
+export const dynamic = 'force-dynamic'
+
 export async function generateMetadata({
   params
 }: {

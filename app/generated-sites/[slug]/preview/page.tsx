@@ -44,8 +44,33 @@ export default function WebsitePreviewPage({
     try {
       const res = await fetch(`/api/generated-sites/${slug}`)
       const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Failed to load website')
+      if (!res.ok) {
+        // Fallback to client-side localStorage backup if serverless instance rotated
+        try {
+          const cached = localStorage.getItem(`nammaspot_site_${slug}`)
+          if (cached) {
+            const parsed = JSON.parse(cached)
+            setSite(parsed)
+            setEditHeadline(parsed.content.heroHeadline)
+            setEditTagline(parsed.content.tagline)
+            setEditSubheadline(parsed.content.heroSubheadline)
+            setEditPrimaryColor(parsed.theme?.colors?.primary || '#1677ff')
+            setEditPhone(parsed.phone || '')
+            // Background resync to warm up server cache
+            fetch('/api/generated-sites', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(parsed)
+            }).catch(() => {})
+            return
+          }
+        } catch {}
+        throw new Error(data.error || 'Failed to load website')
+      }
       setSite(data.site)
+      try {
+        localStorage.setItem(`nammaspot_site_${slug}`, JSON.stringify(data.site))
+      } catch {}
       setEditHeadline(data.site.content.heroHeadline)
       setEditTagline(data.site.content.tagline)
       setEditSubheadline(data.site.content.heroSubheadline)

@@ -1,5 +1,6 @@
 import fs from 'fs'
 import path from 'path'
+import os from 'os'
 import { CategoryTheme } from './theme-engine'
 import { BusinessImage } from './image-service'
 
@@ -39,30 +40,117 @@ export interface GeneratedWebsiteRecord {
   publishedAt?: string
 }
 
-const DATA_DIR = path.join(process.cwd(), 'data')
-const SITES_FILE = path.join(DATA_DIR, 'generated-sites.json')
+// 1. Static seed file included in the repository / deployment
+const SEED_DATA_DIR = path.join(process.cwd(), 'data')
+const SEED_SITES_FILE = path.join(SEED_DATA_DIR, 'generated-sites.json')
 
-function ensureStorageFile() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true })
-    }
-    if (!fs.existsSync(SITES_FILE)) {
-      fs.writeFileSync(SITES_FILE, JSON.stringify([], null, 2), 'utf-8')
-    }
-  } catch (err) {
-    console.error('Error ensuring storage file:', err)
-  }
+// 2. Writable temporary storage path for serverless (Vercel / AWS Lambda)
+const TMP_DATA_DIR = path.join(os.tmpdir(), 'nammaspot-data')
+const TMP_SITES_FILE = path.join(TMP_DATA_DIR, 'generated-sites.json')
+
+// Detect if running on Vercel or similar read-only serverless environment
+const IS_SERVERLESS = Boolean(
+  process.env.VERCEL ||
+  process.env.AWS_LAMBDA_FUNCTION_NAME ||
+  process.env.LAMBDA_TASK_ROOT ||
+  (process.env.NODE_ENV === 'production' && !process.env.LOCAL_DEV)
+)
+
+// Global in-memory cache to guarantee sites persist during warm lambda container lifecycles
+declare global {
+  var __nammaspot_sites_cache__: GeneratedWebsiteRecord[] | undefined
 }
 
+/**
+ * Initializes and retrieves generated sites from:
+ * 1. Global in-memory cache
+ * 2. Writable /tmp storage (for sites generated during serverless sessions)
+ * 3. Seed repository data/generated-sites.json
+ */
 export function getAllGeneratedSites(): GeneratedWebsiteRecord[] {
-  ensureStorageFile()
-  try {
-    const raw = fs.readFileSync(SITES_FILE, 'utf-8')
-    return JSON.parse(raw) as GeneratedWebsiteRecord[]
-  } catch (err) {
-    console.error('Failed reading generated sites:', err)
-    return []
+  // If memory cache exists and has data, return it
+  if (globalThis.__nammaspot_sites_cache__ && Array.isArray(globalThis.__nammaspot_sites_cache__)) {
+    if (globalThis.__nammaspot_sites_cache__.length > 0) {
+      return globalThis.__nammaspot_sites_cache__
+    }
+  }
+
+  let sites: GeneratedWebsiteRecord[] = []
+
+  // Check /tmp first (contains any runtime writes in serverless)
+  if (fs.existsSync(TMP_SITES_FILE)) {
+    try {
+      const raw = fs.readFileSync(TMP_SITES_FILE, 'utf-8')
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        sites = parsed
+      }
+    } catch (err) {
+      console.warn('[storage] Could not read from TMP_SITES_FILE:', err)
+    }
+  }
+
+  // If nothing from TMP, read from bundled SEED file
+  if (sites.length === 0 && fs.existsSync(SEED_SITES_FILE)) {
+    try {
+      const raw = fs.readFileSync(SEED_SITES_FILE, 'utf-8')
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        sites = parsed
+      }
+    } catch (err) {
+      console.warn('[storage] Could not read from SEED_SITES_FILE:', err)
+    }
+  }
+
+  globalThis.__nammaspot_sites_cache__ = sites
+  return sites
+}
+
+/**
+ * Persists the sites array to:
+ * 1. Global in-memory cache (instant & guaranteed non-throwing)
+ * 2. Serverless /tmp writable directory (on Vercel/Lambda)
+ * 3. Local data/ directory (when running locally)
+ * Never throws EROFS or filesystem exceptions.
+ */
+function persistSites(sites: GeneratedWebsiteRecord[]): void {
+  // 1. Update memory cache immediately
+  globalThis.__nammaspot_sites_cache__ = sites
+
+  // 2. Decide write targets
+  // On serverless, always write to TMP first to prevent EROFS
+  const targets = IS_SERVERLESS
+    ? [
+        { dir: TMP_DATA_DIR, file: TMP_SITES_FILE }
+      ]
+    : [
+        { dir: SEED_DATA_DIR, file: SEED_SITES_FILE },
+        { dir: TMP_DATA_DIR, file: TMP_SITES_FILE }
+      ]
+
+  for (const { dir, file } of targets) {
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true })
+      }
+      fs.writeFileSync(file, JSON.stringify(sites, null, 2), 'utf-8')
+      return // Success!
+    } catch (err: any) {
+      console.warn(`[storage] Write to ${file} failed: ${err.message}. Trying next fallback.`)
+    }
+  }
+
+  // Fallback: If not in serverless mode but writing to SEED failed (e.g. permission issues), write to TMP
+  if (!IS_SERVERLESS) {
+    try {
+      if (!fs.existsSync(TMP_DATA_DIR)) {
+        fs.mkdirSync(TMP_DATA_DIR, { recursive: true })
+      }
+      fs.writeFileSync(TMP_SITES_FILE, JSON.stringify(sites, null, 2), 'utf-8')
+    } catch (fallbackErr: any) {
+      console.warn('[storage] Fallback TMP write also failed, record preserved safely in memory:', fallbackErr.message)
+    }
   }
 }
 
@@ -77,8 +165,7 @@ export function getGeneratedSiteById(id: string): GeneratedWebsiteRecord | null 
 }
 
 export function saveGeneratedSite(record: GeneratedWebsiteRecord): GeneratedWebsiteRecord {
-  ensureStorageFile()
-  const sites = getAllGeneratedSites()
+  const sites = [...getAllGeneratedSites()]
   const index = sites.findIndex((s) => s.id === record.id || s.slug === record.slug)
 
   if (index >= 0) {
@@ -87,7 +174,7 @@ export function saveGeneratedSite(record: GeneratedWebsiteRecord): GeneratedWebs
     sites.unshift(record)
   }
 
-  fs.writeFileSync(SITES_FILE, JSON.stringify(sites, null, 2), 'utf-8')
+  persistSites(sites)
   return record
 }
 
@@ -95,8 +182,7 @@ export function updateGeneratedSite(
   slug: string,
   partial: Partial<GeneratedWebsiteRecord>
 ): GeneratedWebsiteRecord | null {
-  ensureStorageFile()
-  const sites = getAllGeneratedSites()
+  const sites = [...getAllGeneratedSites()]
   const index = sites.findIndex((s) => s.slug.toLowerCase() === slug.toLowerCase())
 
   if (index === -1) return null
@@ -117,7 +203,7 @@ export function updateGeneratedSite(
   }
 
   sites[index] = updated
-  fs.writeFileSync(SITES_FILE, JSON.stringify(sites, null, 2), 'utf-8')
+  persistSites(sites)
   return updated
 }
 

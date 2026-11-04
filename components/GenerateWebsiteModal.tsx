@@ -56,6 +56,13 @@ export default function GenerateWebsiteModal({
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Failed to generate website')
 
+      // Save in localStorage as client-side backup for cross-lambda resilience
+      try {
+        if (data.site) {
+          localStorage.setItem(`nammaspot_site_${data.site.slug}`, JSON.stringify(data.site))
+        }
+      } catch {}
+
       // Redirect to preview workstation
       router.push(data.previewUrl)
     } catch (err: any) {
